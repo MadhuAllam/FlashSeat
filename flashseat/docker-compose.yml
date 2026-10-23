@@ -1,0 +1,124 @@
+name: flashseat
+
+# Shared by app + worker. Hostnames are Compose service names, not localhost.
+x-app-env: &app-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_URL: "postgresql://${POSTGRES_USER:-flashseat}:${POSTGRES_PASSWORD:-flashseat}@postgres:5432/${POSTGRES_DB:-flashseat}?connection_limit=${DB_POOL_SIZE:-20}&pool_timeout=10"
+  REDIS_URL: redis://redis:6379
+  # Dev-only defaults so `docker compose up` works out of the box. Override in .env for anything real.
+  JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-dev-only-change-me}
+  PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:-whsec_dev_only_change_me}
+  HOLD_TTL_SECONDS: ${HOLD_TTL_SECONDS:-480}
+  MAX_SEATS_PER_HOLD: ${MAX_SEATS_PER_HOLD:-6}
+  RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+  RATE_LIMIT_MAX_PER_USER: ${RATE_LIMIT_MAX_PER_USER:-20}
+  RATE_LIMIT_MAX_PER_IP: ${RATE_LIMIT_MAX_PER_IP:-300}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-10}
+
+services:
+  # ───────────────────────── PostgreSQL: source of truth ─────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flashseat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashseat}
+      POSTGRES_DB: ${POSTGRES_DB:-flashseat}
+    command:
+      - postgres
+      - -c
+      - max_connections=200        # must exceed (replicas x DB_POOL_SIZE)
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - log_lock_waits=on          # surfaces FOR UPDATE contention in the logs
+      - -c
+      - deadlock_timeout=1s
+      - -c
+      - log_min_duration_statement=200
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ───────────────────────── Redis: locks, idempotency, rate limits, BullMQ ─────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction is REQUIRED by BullMQ and by correctness: an evicted lock or job is a lost lock or job.
+    # AOF (everysec) keeps queued jobs across restarts; the DB is the source of truth for seats regardless.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ───────────────────────── one-shot: apply migrations ─────────────────────────
+  migrate:
+    build: { context: ., target: deps }
+    image: flashseat-tools
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # ───────────────────────── API ─────────────────────────
+  app:
+    build: { context: ., target: runner }
+    image: flashseat-app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: flashseat-api
+      PORT: 3000
+    ports: ["3000:3000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    stop_grace_period: 15s
+
+  # ───────────────────────── Worker (BullMQ processors — Phase 4) ─────────────────────────
+  worker:
+    build: { context: ., target: runner }
+    image: flashseat-app
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment:
+      <<: *app-env
+      SERVICE_NAME: flashseat-worker
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    stop_grace_period: 30s   # let in-flight jobs finish on deploy
+
+  # ───────────────────────── opt-in: seed data ─────────────────────────
+  #   docker compose --profile tools run --rm seed
+  #   SEED_USERS=5000 docker compose --profile tools run --rm seed
+  seed:
+    image: flashseat-tools
+    profiles: ["tools"]
+    command: ["npx", "prisma", "db", "seed"]
+    environment:
+      <<: *app-env
+      SEED_USERS: ${SEED_USERS:-100}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
+  redisdata:

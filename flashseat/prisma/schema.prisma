@@ -1,0 +1,215 @@
+// FlashSeat — PostgreSQL schema
+//
+// Things Prisma cannot express live in the hand-written migration
+// `*_constraints_and_partial_indexes`:
+//   - partial indexes (WHERE ...)            e.g. uq_booking_items_confirmed_seat
+//   - CHECK constraints                      e.g. price_cents >= 0
+// Prisma ignores both when diffing, so they do not cause migration drift.
+
+generator client {
+  provider      = "prisma-client-js"
+  // "native" for local dev, debian for the Docker runtime image
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum EventStatus {
+  DRAFT
+  ON_SALE
+  SOLD_OUT
+  CANCELLED
+  COMPLETED
+
+  @@map("event_status")
+}
+
+// The DB only ever knows AVAILABLE | BOOKED. "HELD" exists only in Redis.
+enum SeatStatus {
+  AVAILABLE
+  BOOKED
+
+  @@map("seat_status")
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  EXPIRED
+  CANCELLED
+  REFUNDED
+
+  @@map("booking_status")
+}
+
+enum PaymentStatus {
+  INITIATED
+  SUCCEEDED
+  FAILED
+  REFUNDED
+
+  @@map("payment_status")
+}
+
+// ───────────────────────────── Models ─────────────────────────────
+
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // Emails are lower-cased by the application before write/lookup.
+  email        String   @unique
+  name         String
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  bookings Booking[]
+
+  @@map("users")
+}
+
+model Venue {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  city      String
+  address   String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  seats  Seat[]
+  events Event[]
+
+  @@map("venues")
+}
+
+/// Physical seat template for a venue — reused by every event at that venue.
+model Seat {
+  id         String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venueId    String @map("venue_id") @db.Uuid
+  section    String
+  rowLabel   String @map("row_label")
+  seatNumber Int    @map("seat_number")
+
+  venue      Venue       @relation(fields: [venueId], references: [id])
+  eventSeats EventSeat[]
+
+  @@unique([venueId, section, rowLabel, seatNumber])
+  @@map("seats")
+}
+
+model Event {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  venueId      String      @map("venue_id") @db.Uuid
+  title        String
+  startsAt     DateTime    @map("starts_at") @db.Timestamptz(6)
+  saleStartsAt DateTime    @map("sale_starts_at") @db.Timestamptz(6)
+  saleEndsAt   DateTime    @map("sale_ends_at") @db.Timestamptz(6)
+  status       EventStatus @default(DRAFT)
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  venue      Venue       @relation(fields: [venueId], references: [id])
+  eventSeats EventSeat[]
+  bookings   Booking[]
+
+  @@index([status, saleStartsAt], map: "idx_events_status_sale")
+  @@index([venueId, startsAt], map: "idx_events_venue_start")
+  @@map("events")
+}
+
+/// Per-event inventory — THE row that gets `SELECT ... FOR UPDATE` at confirm time.
+model EventSeat {
+  id         String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  eventId    String     @map("event_id") @db.Uuid
+  seatId     String     @map("seat_id") @db.Uuid
+  priceCents Int        @map("price_cents")
+  currency   String     @default("INR") @db.Char(3)
+  status     SeatStatus @default(AVAILABLE)
+  version    Int        @default(0)
+  updatedAt  DateTime   @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  event        Event         @relation(fields: [eventId], references: [id])
+  seat         Seat          @relation(fields: [seatId], references: [id])
+  bookingItems BookingItem[]
+
+  @@unique([eventId, seatId])
+  // + partial index idx_event_seats_available (raw migration)
+  @@map("event_seats")
+}
+
+model Booking {
+  id            String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  eventId       String        @map("event_id") @db.Uuid
+  status        BookingStatus @default(PENDING_PAYMENT)
+  totalCents    Int           @map("total_cents")
+  currency      String        @default("INR") @db.Char(3)
+  holdId        String        @map("hold_id") @db.Uuid
+  holdExpiresAt DateTime      @map("hold_expires_at") @db.Timestamptz(6)
+  // DB-level idempotency backstop behind the Redis Idempotency-Key middleware.
+  idempotencyKey String       @map("idempotency_key")
+  ticketUrl     String?       @map("ticket_url")
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  confirmedAt   DateTime?     @map("confirmed_at") @db.Timestamptz(6)
+
+  user     User          @relation(fields: [userId], references: [id])
+  event    Event         @relation(fields: [eventId], references: [id])
+  items    BookingItem[]
+  payments Payment[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt(sort: Desc)], map: "idx_bookings_user")
+  // + partial index idx_bookings_pending_expiry (raw migration)
+  @@map("bookings")
+}
+
+model BookingItem {
+  id          String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId   String  @map("booking_id") @db.Uuid
+  eventSeatId String  @map("event_seat_id") @db.Uuid
+  priceCents  Int     @map("price_cents")
+  confirmed   Boolean @default(false)
+
+  booking   Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  eventSeat EventSeat @relation(fields: [eventSeatId], references: [id])
+
+  @@unique([bookingId, eventSeatId])
+  @@index([eventSeatId], map: "idx_booking_items_event_seat")
+  // ★ + partial UNIQUE index uq_booking_items_confirmed_seat ON (event_seat_id) WHERE confirmed
+  //   (raw migration) — the last line of defence against double-booking.
+  @@map("booking_items")
+}
+
+model Payment {
+  id                String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bookingId         String        @map("booking_id") @db.Uuid
+  provider          String        @default("mock-gateway")
+  providerPaymentId String        @unique @map("provider_payment_id")
+  amountCents       Int           @map("amount_cents")
+  status            PaymentStatus @default(INITIATED)
+  // Webhook replay protection: a redelivered webhook violates this UNIQUE.
+  webhookEventId    String?       @unique @map("webhook_event_id")
+  rawPayload        Json?         @map("raw_payload")
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  booking Booking @relation(fields: [bookingId], references: [id])
+
+  @@index([bookingId], map: "idx_payments_booking")
+  @@map("payments")
+}
+
+/// Transactional outbox: written in the SAME transaction as the booking
+/// confirmation, then published to BullMQ. Guarantees "committed => enqueued".
+model OutboxEvent {
+  id          BigInt    @id @default(autoincrement())
+  aggregateId String    @map("aggregate_id") @db.Uuid
+  type        String
+  payload     Json
+  publishedAt DateTime? @map("published_at") @db.Timestamptz(6)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  // + partial index idx_outbox_unpublished WHERE published_at IS NULL (raw migration)
+  @@map("outbox_events")
+}
